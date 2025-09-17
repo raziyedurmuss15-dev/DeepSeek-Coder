@@ -1,0 +1,822 @@
+# -*- coding: utf-8 -*-
+# İdaş Yatak Seçim Asistanı — PDF'teki TÜM yataklar + bazalar yönetim panelinde; öneri yalnız stoktaki yataklardan
+# Fiyatlar: YATAK_DB (ölçü bazında). Yoksa aynı ölçünün SET_DB %45’i fallback (müşteriye gösterilmez).
+# UI: Müşteri Formu • (Öneriler aynı sekmede) • Yönetim Paneli. Linkler tıklanabilir (varsayılan tarayıcıda açılır).
+# EK: "Detaylı Tarama Yap" (omuz-bel-diz) opsiyonel girişi; vücut tipi tek harf kodu (rapora harf olarak yansır).
+
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+import webbrowser, datetime, tempfile, json
+from urllib.parse import quote
+import logging
+
+
+# ========== Yardımcılar ==========
+def cm_to_px(root, cm):
+    inch_px = root.winfo_fpixels('1i')
+    return int(round(inch_px * (cm / 2.54)))
+
+def place_image_panel(parent, image_path, width_cm=8, height_cm=4):
+    try:
+        px_w = cm_to_px(parent.winfo_toplevel(), width_cm)
+        px_h = cm_to_px(parent.winfo_toplevel(), height_cm)
+        canvas = tk.Canvas(parent, width=px_w, height=px_h, highlightthickness=0, bg="white")
+        canvas.pack()
+        img = tk.PhotoImage(file=image_path)  # PNG/GIF
+        fx = max(img.width() // px_w, 1); fy = max(img.height() // px_h, 1)
+        factor = max(fx, fy)
+        scaled = img.subsample(factor, factor)
+        canvas.image_ref = scaled
+        canvas.create_image(px_w//2, px_h//2, image=scaled, anchor="center")
+        return canvas
+    except Exception as e:
+        logging.warning(f"Logo/Resim yüklenemedi: {e}")
+        return None
+
+def slugify(name):
+    tr_map = str.maketrans("çğıöşüÇĞİÖŞÜ ", "cgiosuCGIOSU-")
+    s = name.translate(tr_map)
+    s = "".join(ch for ch in s if ch.isalnum() or ch in "-")
+    s = s.replace("--","-").strip("-").lower()
+    return f"https://www.idas.com.tr/tr/urun/{s}"
+
+POSITION_OPTIONS = ["Yan","Sırtüstü","Yüzüstü","Karışık","Yan+Sırt","Çift Yan"]
+
+def infer_segment(price):
+    if price is None: return None
+    if price < 12000: return "Başlangıç"
+    if price < 18000: return "Orta"
+    if price < 25000: return "Premium"
+    return "Platinum"
+
+def rec_firmness(bmi, pos, issues):
+    score = 3
+    if bmi>=30: score += 1
+    if bmi<=18.5: score -= 1
+    if "bel" in issues or "sirt" in issues: score = max(score,4)
+    if pos == "Yüzüstü": score = max(score,4)
+    if pos in ("Yan","Yan+Sırt","Çift Yan"): score = min(score,3)
+    return max(1,min(5,score))
+
+def validate_numeric_input(value, field_name):
+    try:
+        return float(value) > 0
+    except ValueError:
+        return False
+
+# --- Vücut tipi sınıflandırma: omuz-bel-diz oranlarına göre tek harf kod ---
+# A: Omuz-baskın  • B: Dengeli  • C: Bel-baskın  • D: Diz/yan baskı belirgin
+def classify_body(shoulder_cm, waist_cm, knee_cm):
+    try:
+        s = float(shoulder_cm); w = float(waist_cm); k = float(knee_cm)
+        if s<=0 or w<=0 or k<=0: return None
+    except Exception:
+        return None
+    r1 = s / w
+    r2 = k / w
+    if r1 >= 1.20 and r2 <= 1.10:
+        return "A"
+    if r2 >= 1.20:
+        return "D"
+    if r1 <= 0.95:
+        return "C"
+    return "B"
+
+class HyperlinkManager:
+    def __init__(self, text):
+        self.text = text
+        self.text.tag_config("hyper", foreground="blue", underline=True)
+        self.text.tag_bind("hyper", "<Enter>", lambda e: self.text.config(cursor="hand2"))
+        self.text.tag_bind("hyper", "<Leave>", lambda e: self.text.config(cursor=""))
+        self.links = {}
+    def add(self, action):
+        tag = f"hyper-{len(self.links)}"
+        self.links[tag] = action
+        def click(event, tag=tag):
+            self.links[tag]()
+        self.text.tag_bind(tag, "<Button-1>", click)
+        return ("hyper", tag)
+
+APP_TITLE = "İdaş Yatak Seçim Asistanı — PDF Tüm Yataklar & Bazalar"
+WINDOW_SIZE = "1320x940"
+
+# ========== PDF'ten çıkarılmış YATAK fiyatları (9 taksitli) ==========
+# --- Fiyat verileri (JSON yerine doğrudan Python dict) ---
+YATAK_DB = {
+  "Altin Ortopedi̇k": {"90x190": 10244.0, "90x200": 10433.0, "100x200": 11035.0, "120x200": 12475.0, "140x190": 14318.0, "140x200": 14495.0, "150x200": 15019.0, "160x200": 15419.0},
+  "Arya": {"90x190": 12166.0, "90x200": 12359.0, "100x200": 13094.0, "120x200": 14505.0, "140x190": 15876.0, "140x200": 16258.0, "150x200": 16985.0, "160x200": 17681.0},
+  "Balance": {"90x190": 20958.0, "90x200": 21306.0, "100x200": 22856.0, "120x200": 25458.0, "140x190": 30521.0, "140x200": 31199.0, "150x200": 32756.0, "160x200": 34140.0, "180x200": 37124.0, "200x200": 40356.0},
+  "Bohem": {"90x190": 18457.0, "90x200": 18710.0, "100x200": 19827.0, "120x200": 22224.0, "140x190": 26949.0, "140x200": 27340.0, "150x200": 28376.0, "160x200": 29213.0, "180x200": 31815.0, "200x200": 34556.0},
+  "Boston Lateks": {"90x190": 29306.0, "90x200": 29655.0, "100x200": 31211.0, "120x200": 34224.0, "140x190": 40230.0, "140x200": 40824.0, "150x200": 42471.0, "160x200": 43685.0, "180x200": 47448.0, "200x200": 51354.0},
+  "Bulky": {"80x180": 6510.0, "80x190": 6853.0, "90x190": 7213.0, "90x200": 7493.0, "100x200": 8071.0, "120x200": 9226.0, "140x190": 10092.0, "140x200": 10381.0, "150x200": 10958.0, "160x200": 11536.0},
+  "Collagen": {"90x190": 23644.0, "90x200": 23993.0, "100x200": 25554.0, "120x200": 28162.0, "140x190": 33739.0, "140x200": 34322.0, "150x200": 35977.0, "160x200": 37361.0, "180x200": 40854.0, "200x200": 44488.0},
+  "Combo": {"90x190": 13995.0, "90x200": 14248.0, "100x200": 15066.0, "120x200": 16875.0, "140x190": 19241.0, "140x200": 19622.0, "150x200": 20445.0, "160x200": 21035.0, "180x200": 23277.0, "200x200": 25583.0},
+  "Cool & Warm": {"90x190": 16894.0, "90x200": 17147.0, "100x200": 18115.0, "120x200": 20277.0, "140x190": 23424.0, "140x200": 23805.0, "150x200": 24950.0, "160x200": 25716.0, "180x200": 28213.0, "200x200": 30537.0},
+  "Cool Comfort": {"90x190": 15325.0, "90x200": 15578.0, "100x200": 16536.0, "120x200": 18534.0, "140x190": 21362.0, "140x200": 21634.0, "150x200": 22539.0, "160x200": 23224.0, "180x200": 25545.0, "200x200": 28015.0},
+  "Cover": {"90x190": 22985.0, "90x200": 23334.0, "100x200": 24890.0, "120x200": 27312.0, "140x190": 32674.0, "140x200": 33357.0, "150x200": 34924.0, "160x200": 36216.0, "180x200": 39693.0, "200x200": 43290.0},
+  "Dense Deluxe": {"90x190": 26210.0, "90x200": 26559.0, "100x200": 28026.0, "120x200": 30939.0, "140x190": 36316.0, "140x200": 36910.0, "150x200": 38569.0, "160x200": 39863.0, "180x200": 43883.0, "200x200": 48041.0},
+  "Elegance": {"90x190": 25761.0, "90x200": 26029.0, "100x200": 27435.0, "120x200": 30167.0, "140x190": 35606.0, "140x200": 36079.0, "150x200": 37561.0, "160x200": 39053.0, "180x200": 42712.0, "200x200": 46398.0},
+  "Grandeur": {"120x200": 36238.0, "140x190": 39689.0, "140x200": 39977.0, "150x200": 42576.0, "160x200": 44886.0, "180x200": 48928.0, "200x200": 53115.0},
+  "Harmony": {"90x190": 14361.0, "90x200": 14614.0, "100x200": 15487.0, "120x200": 17226.0, "140x190": 19797.0, "140x200": 20069.0, "150x200": 21065.0, "160x200": 21645.0, "180x200": 24018.0, "200x200": 26354.0},
+  "I-Tech": {"90x190": 28539.0, "90x200": 28888.0, "100x200": 30346.0, "120x200": 33362.0, "140x190": 38879.0, "140x200": 39462.0, "150x200": 41023.0, "160x200": 42239.0, "180x200": 45988.0, "200x200": 49792.0},
+  "Legendary": {"90x190": 31806.0, "90x200": 32155.0, "100x200": 33731.0, "120x200": 36807.0, "140x190": 42848.0, "140x200": 43441.0, "150x200": 45099.0, "160x200": 46565.0, "180x200": 50718.0, "200x200": 54884.0},
+  "Memory Smart": {"90x190": 17731.0, "90x200": 17984.0, "100x200": 19033.0, "120x200": 21355.0, "140x190": 24378.0, "140x200": 24759.0, "150x200": 25527.0, "160x200": 26203.0, "180x200": 28727.0, "200x200": 31187.0},
+  "Miracle": {"90x190": 18335.0, "90x200": 18527.0, "100x200": 20438.0, "120x200": 23689.0, "140x190": 26557.0, "140x200": 27130.0, "150x200": 29042.0, "160x200": 30380.0, "180x200": 34395.0, "200x200": 37646.0},
+  "Moon": {"80x180": 6056.0, "80x190": 6235.0, "90x190": 6593.0, "90x200": 6961.0, "100x200": 7328.0, "120x200": 8246.0, "140x190": 8915.0, "140x200": 9093.0, "150x200": 9629.0, "160x200": 9987.0},
+  "Multi Relax": {"80x180": 6949.0, "80x190": 7128.0, "90x190": 7648.0, "90x200": 8209.0, "100x200": 8583.0, "120x200": 9705.0, "140x190": 10701.0, "140x200": 10898.0, "150x200": 11512.0, "160x200": 12309.0},
+  "Natura Smart": {"90x190": 23059.0, "90x200": 23408.0, "100x200": 24966.0, "120x200": 27606.0, "140x190": 32865.0, "140x200": 33538.0, "150x200": 35092.0, "160x200": 36486.0, "180x200": 39972.0, "200x200": 43595.0},
+  "Rosa Latali": {"90x190": 15664.0, "90x200": 15917.0, "100x200": 16954.0, "120x200": 19069.0, "140x190": 21964.0, "140x200": 22235.0, "150x200": 23136.0, "160x200": 23811.0, "180x200": 26084.0, "200x200": 28527.0},
+  "Sapphire": {"90x190": 27969.0, "90x200": 28317.0, "100x200": 29873.0, "120x200": 32613.0, "140x190": 38486.0, "140x200": 39079.0, "150x200": 40735.0, "160x200": 42018.0, "180x200": 45801.0, "200x200": 49723.0},
+  "Silva": {"90x190": 20034.0, "90x200": 20287.0, "100x200": 21401.0, "120x200": 23516.0, "140x190": 27024.0, "140x200": 27395.0, "150x200": 28335.0, "160x200": 29027.0, "180x200": 31619.0, "200x200": 34350.0},
+  "Sleeping Space": {"90x190": 31455.0, "90x200": 31804.0, "100x200": 33358.0, "120x200": 36262.0, "140x190": 42667.0, "140x200": 43260.0, "150x200": 44912.0, "160x200": 46295.0, "180x200": 50555.0, "200x200": 54699.0},
+  "Slide": {"90x190": 16779.0, "90x200": 17032.0, "100x200": 17989.0, "120x200": 20035.0, "140x190": 23020.0, "140x200": 23292.0, "150x200": 24193.0, "160x200": 24868.0, "180x200": 27206.0, "200x200": 29667.0},
+  "Smarttech": {"90x190": 29242.0, "90x200": 29600.0, "100x200": 31156.0, "120x200": 34139.0, "140x190": 40075.0, "140x200": 40669.0, "150x200": 42319.0, "160x200": 43597.0, "180x200": 47350.0, "200x200": 51246.0},
+  "Smarttech Energy": {"90x190": 32864.0, "90x200": 33213.0, "100x200": 34779.0, "120x200": 37809.0, "140x190": 43917.0, "140x200": 44510.0, "150x200": 46173.0, "160x200": 47635.0, "180x200": 51665.0, "200x200": 55792.0},
+  "Soho": {"90x190": 22588.0, "90x200": 22937.0, "100x200": 24481.0, "120x200": 26916.0, "140x190": 32185.0, "140x200": 32861.0, "150x200": 34419.0, "160x200": 35799.0, "180x200": 39286.0, "200x200": 42893.0},
+  "Twin": {"90x190": 17124.0, "90x200": 17386.0, "100x200": 18443.0, "120x200": 20602.0, "140x190": 23559.0, "140x200": 23825.0, "150x200": 24655.0, "160x200": 25331.0, "180x200": 27665.0, "200x200": 30128.0},
+  "Vario": {"90x190": 24711.0, "90x200": 25070.0, "100x200": 26631.0, "120x200": 29420.0, "140x190": 35101.0, "140x200": 35712.0, "150x200": 37366.0, "160x200": 38740.0, "180x200": 42687.0, "200x200": 46797.0},
+  "Vega": {"90x190": 16958.0, "90x200": 17161.0, "100x200": 18202.0, "120x200": 20085.0, "140x190": 24833.0, "140x200": 25119.0, "150x200": 25959.0, "160x200": 26522.0},
+  "Wooly Plus": {"90x190": 19565.0, "90x200": 19818.0, "100x200": 20867.0, "120x200": 23164.0, "140x190": 27173.0, "140x200": 27543.0, "150x200": 28479.0, "160x200": 29261.0, "180x200": 31764.0, "200x200": 34321.0}
+}
+
+BAZA_DB = {
+  "Baza": {"90x190": 8450.0, "90x200": 8962.0, "100x200": 9238.0, "120x200": 10734.0, "140x190": 14356.0, "140x200": 14558.0, "150x200": 14761.0, "160x200": 14829.0, "180x200": 16178.0, "200x200": 17393.0},
+  "Lotus Baza": {"150x200": 26534.0, "160x200": 26919.0, "180x200": 28073.0, "200x200": 29228.0}
+}
+
+SET_DB = {
+  "Sedef Set": {"90x190": 17127.0, "90x200": 17406.0, "100x200": 18521.0, "120x200": 20472.0, "140x190": 25628.0, "140x200": 26046.0, "150x200": 26882.0, "160x200": 27718.0, "180x200": 29530.0, "200x200": 31481.0},
+  "Mercan Set": {"90x190": 19364.0, "90x200": 19629.0, "100x200": 20957.0, "120x200": 23213.0, "140x190": 28256.0, "140x200": 28787.0, "150x200": 29849.0, "160x200": 30778.0, "180x200": 32636.0, "200x200": 34347.0},
+  "Mars Set": {"90x190": 14056.0, "90x200": 14585.0, "100x200": 15277.0, "120x200": 17155.0, "140x190": 19543.0, "140x200": 19952.0, "150x200": 20738.0, "160x200": 21349.0, "180x200": 23229.0, "200x200": 25204.0}
+}
+
+
+# Bazı ürünlere teknik/sertlik/özellik override (gösterim için)
+FEATURE_OVERRIDES = {
+    "Moon": {"tech":["Konfor Katmanları","Nefes Alabilir Kumaş"], "firmness":3, "height":24, "war":2},
+    "Vega": {"tech":["Bonnell Frame","Nefes Alabilen Yüzey"], "firmness":3, "height":25, "war":2},
+    "Bulky": {"tech":["Gelişmiş Yay Desteği"], "firmness":4, "height":27, "war":2},
+    "Multi Relax": {"tech":["Çok Katmanlı Konfor"], "firmness":3, "height":26, "war":2},
+    "Arya": {"tech":["Dengeli Destek"], "firmness":3, "height":26, "war":2},
+    "Mars": {"tech":["Günlük Konfor"], "firmness":3, "height":23, "war":2}
+}
+
+# Kanonik ürün linkleri
+PRODUCT_LINKS = {
+    "Moon": "https://www.idas.com.tr/tr/urun/moon-yatak",
+    "Vega": "https://www.idas.com.tr/tr/urun/vega-klimatik-yatak",
+    "Arya": "https://www.idas.com.tr/tr/urun/arya-yayli-yatak",
+    "Wooly Plus": "https://www.idas.com.tr/tr/urun/wooly-plus-yatak",
+    "Bulky": "https://www.idas.com.tr/tr/urun/bulky-ortopedik-yatak",
+    "Bohem": "https://www.idas.com.tr/tr/urun/bohem-yatak",
+    "Immense": "https://www.idas.com.tr/tr/urun/immense-visco-yatak",
+    "Mira-Coil Ortopedik": "https://www.idas.com.tr/tr/urun/mira-coil-ortopedik-yatak",
+    "Elegance": "https://www.idas.com.tr/tr/urun/elegance-mira-coil-yatak",
+    "Lauren": "https://www.idas.com.tr/tr/urun/lauren-yatak",
+    "Mars": "https://www.idas.com.tr/tr/urun/mars-alerji-karsiti-yatak",
+    "Cool & Warm": "https://www.idas.com.tr/tr/urun/coolwarm-yatak",
+    "Smarttech Energy": "https://www.idas.com.tr/tr/urun/smarttech-energy-yayli-yatak",
+    "Smarttech": "https://www.idas.com.tr/tr/urun/smarttech-yayli-yatak",
+    "Boston Lateks": "https://www.idas.com.tr/tr/urun/boston-latex-mira-coil-yatak",
+    "Memory 50 Plus": "https://www.idas.com.tr/tr/urun/memory-50-plus-ortopedik-yatak"
+}
+
+def get_price(name, size):
+    if name in YATAK_DB and size in YATAK_DB[name]:
+        return float(YATAK_DB[name][size])
+    # fallback: aynı ölçünün set fiyatının %45'i
+    for smap in SET_DB.values():
+        if size in smap:
+            return round(float(smap[size]) * 0.45, 2)
+    return None
+
+# ========== Uygulama ==========
+class App:
+    def __init__(self, root):
+        self.root = root
+        root.title(APP_TITLE)
+        root.geometry(WINDOW_SIZE)
+
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+        self.mattresses = self._build_mattress_catalog()
+        self.bases = self._build_base_catalog()
+
+        self.stock_mattress_vars = {}
+        self.stock_base_vars = {}
+        self.extra_alternatives = []
+        self.last_suggestions = []
+        self.cart = []  # Teklife eklenen ürünler
+
+        # Detaylı tarama değişkenleri (opsiyonel)
+        self.u1_shoulder = tk.StringVar(); self.u1_waist = tk.StringVar(); self.u1_knee = tk.StringVar()
+        self.u2_shoulder = tk.StringVar(); self.u2_waist = tk.StringVar(); self.u2_knee = tk.StringVar()
+        self.u1_body_code = tk.StringVar(value="-")
+        self.u2_body_code = tk.StringVar(value="-")
+
+        self.notebook = ttk.Notebook(root)
+        self.notebook.pack(fill="both", expand=True)
+
+        self.tab_form = ttk.Frame(self.notebook, padding=10)
+        self.tab_admin = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(self.tab_form, text="Müşteri Formu")
+        self.notebook.add(self.tab_admin, text="Yönetim Paneli")
+
+        self.build_form()
+        self.build_admin()
+        self.logo_path = tk.StringVar(value="idas_logo.png")  # Varsayılan logo
+
+    def _resolve_url(self, name):
+        return PRODUCT_LINKS.get(name, slugify(name))
+
+    def _build_mattress_catalog(self):
+        cat=[]
+        for name in sorted(YATAK_DB.keys()):
+            ov = FEATURE_OVERRIDES.get(name, {})
+            cat.append({
+                "name": name,
+                "url": self._resolve_url(name),
+                "tech": ov.get("tech", []),
+                "firmness_1_5": ov.get("firmness", 3),
+                "height_cm": ov.get("height", "-"),
+                "warranty_years": ov.get("war", 2)
+            })
+        return cat
+
+    def _build_base_catalog(self):
+        cat=[]
+        for name in sorted(BAZA_DB.keys()):
+            cat.append({"name": name, "url": self._resolve_url(name)})
+        return cat
+
+    def mk_person_block(self, parent, h, w, a, pos, bel, boyun, ter, alerji):
+        fr = ttk.Frame(parent)
+        fr.pack(fill="x", padx=6, pady=4)
+
+        ttk.Label(fr, text="Boy (cm)").grid(row=0, column=0, sticky="e", padx=3, pady=2)
+        ttk.Entry(fr, textvariable=h, width=8).grid(row=0, column=1, sticky="w")
+
+        ttk.Label(fr, text="Kilo (kg)").grid(row=0, column=2, sticky="e", padx=6)
+        ttk.Entry(fr, textvariable=w, width=8).grid(row=0, column=3, sticky="w")
+
+        ttk.Label(fr, text="Yaş").grid(row=0, column=4, sticky="e", padx=6)
+        ttk.Entry(fr, textvariable=a, width=6).grid(row=0, column=5, sticky="w")
+
+        ttk.Label(fr, text="Uyku Pozisyonu").grid(row=0, column=6, sticky="e", padx=6)
+        ttk.Combobox(
+            fr,
+            values=POSITION_OPTIONS,
+            textvariable=pos,
+            state="readonly",
+            width=12
+        ).grid(row=0, column=7, sticky="w")
+
+        ch = ttk.Frame(parent)
+        ch.pack(fill="x", padx=6, pady=(0, 6))
+        ttk.Checkbutton(ch, text="Bel/Sırt Ağrısı", variable=bel).pack(side="left")
+        ttk.Checkbutton(ch, text="Boyun Ağrısı", variable=boyun).pack(side="left", padx=6)
+        ttk.Checkbutton(ch, text="Aşırı Terleme", variable=ter).pack(side="left", padx=6)
+        ttk.Checkbutton(ch, text="Alerji", variable=alerji).pack(side="left", padx=6)
+
+    def build_form(self):
+        f=self.tab_form
+        # Sağ üstte logo alanı
+        topbar = ttk.Frame(f)
+        topbar.grid(row=0, column=1, sticky="ne", padx=10, pady=5)
+        self.front_logo_holder = tk.Frame(topbar)
+        self.front_logo_holder.pack()
+        self.refresh_logo(self.front_logo_holder)
+
+        ttk.Label(f,text="Müşteri Bilgileri",font=("Arial",13,"bold")).grid(row=0,column=0,sticky="w")
+        info=ttk.Frame(f); info.grid(row=1,column=0,sticky="we",pady=(6,12))
+        info.columnconfigure(3, weight=1)
+        self.var_name=tk.StringVar(); self.var_mail=tk.StringVar(); self.var_phone=tk.StringVar()
+        ttk.Label(info,text="Müşteri Adı:").grid(row=0,column=0,sticky="e",padx=4,pady=3)
+        ttk.Entry(info,textvariable=self.var_name,width=28).grid(row=0,column=1,sticky="w")
+        ttk.Label(info,text="E-posta:").grid(row=0,column=2,sticky="e",padx=4)
+        ttk.Entry(info,textvariable=self.var_mail,width=28).grid(row=0,column=3,sticky="w")
+        ttk.Label(info,text="Cep Tel:").grid(row=0,column=4,sticky="e",padx=4)
+        ttk.Entry(info,textvariable=self.var_phone,width=18).grid(row=0,column=5,sticky="w")
+        self.var_date=tk.StringVar(value=datetime.date.today().strftime("%d.%m.%Y"))
+        ttk.Label(info,text="Teklif Tarihi:").grid(row=0,column=6,sticky="e",padx=4)
+        ttk.Entry(info,textvariable=self.var_date,width=12,state="readonly").grid(row=0,column=7,sticky="w")
+
+        ttk.Label(f,text="Yatak Ölçüsü",font=("Arial",11,"bold")).grid(row=2,column=0,sticky="w")
+        r2=ttk.Frame(f); r2.grid(row=3,column=0,sticky="we",pady=4)
+        self.var_size=tk.StringVar(value="160x200")
+        sizes=["80x180","80x190","90x190","90x200","100x200","120x200","140x190","140x200","150x200","160x200","180x200","200x200"]
+        ttk.Combobox(r2,values=sizes,textvariable=self.var_size,width=12,state="readonly").pack(side="left",padx=(0,8))
+
+        ttk.Label(f,text="Kullanıcı Bilgileri",font=("Arial",11,"bold")).grid(row=4,column=0,sticky="w",pady=(6,0))
+        p1=ttk.LabelFrame(f,text="1. Kişi"); p1.grid(row=5,column=0,sticky="we",pady=4)
+        self.u1_height=tk.StringVar(); self.u1_weight=tk.StringVar(); self.u1_age=tk.StringVar()
+        self.u1_pos=tk.StringVar(value="Yan")
+        self.u1_bel=tk.BooleanVar(); self.u1_boyun=tk.BooleanVar(); self.u1_ter=tk.BooleanVar(); self.u1_alerji=tk.BooleanVar()
+        self.mk_person_block(p1,self.u1_height,self.u1_weight,self.u1_age,self.u1_pos,self.u1_bel,self.u1_boyun,self.u1_ter,self.u1_alerji)
+
+        br1 = ttk.Frame(p1); br1.pack(anchor="w", padx=6, pady=(0,4))
+        ttk.Button(br1, text="Detaylı Tarama Yap", command=lambda: self.open_detail_scan('u1')).pack(side="left")
+        self.lbl_u1_code = ttk.Label(br1, text="Vücut Kodu: -"); self.lbl_u1_code.pack(side="left", padx=8)
+
+        r3=ttk.Frame(f); r3.grid(row=6,column=0,sticky="we",pady=(4,0))
+        ttk.Label(r3,text="Kaç kişi yatacak?").pack(side="left",padx=(0,8))
+        self.var_people=tk.StringVar(value="1")
+        ttk.Combobox(r3,values=["1","2"],textvariable=self.var_people,width=6,state="readonly").pack(side="left")
+
+        self.p2_frame=ttk.LabelFrame(f,text="2. Kişi (Eş)"); self.p2_frame.grid(row=7,column=0,sticky="we",pady=4)
+        self.u2_height=tk.StringVar(); self.u2_weight=tk.StringVar(); self.u2_age=tk.StringVar()
+        self.u2_pos=tk.StringVar(value="Yan")
+        self.u2_bel=tk.BooleanVar(); self.u2_boyun=tk.BooleanVar(); self.u2_ter=tk.BooleanVar(); self.u2_alerji=tk.BooleanVar()
+        self.mk_person_block(self.p2_frame,self.u2_height,self.u2_weight,self.u2_age,self.u2_pos,self.u2_bel,self.u2_boyun,self.u2_ter,self.u2_alerji)
+
+        br2 = ttk.Frame(self.p2_frame); br2.pack(anchor="w", padx=6, pady=(0,4))
+        ttk.Button(br2, text="Detaylı Tarama Yap", command=lambda: self.open_detail_scan('u2')).pack(side="left")
+        self.lbl_u2_code = ttk.Label(br2, text="Vücut Kodu: -"); self.lbl_u2_code.pack(side="left", padx=8)
+
+        self.p2_frame.grid_remove()
+        self.var_people.trace_add("write", lambda *_: (self.p2_frame.grid() if self.var_people.get()=="2" else self.p2_frame.grid_remove()))
+
+        segrow=ttk.Frame(f); segrow.grid(row=8,column=0,sticky="we",pady=(6,4))
+        ttk.Label(segrow,text="Bütçe Segmenti",font=("Arial",11,"bold")).pack(side="left",padx=(0,8))
+        self.var_segment=tk.StringVar(value="(Seçilmedi)")
+        ttk.Combobox(segrow,values=["(Seçilmedi)","Başlangıç","Orta","Premium","Platinum"],textvariable=self.var_segment,state="readonly",width=14).pack(side="left")
+        ttk.Label(segrow, text="* Segment seçimi öncelikli öneri sağlar", foreground="gray").pack(side="left", padx=(10,0))
+
+        # Butonlar
+        btns=ttk.Frame(f); btns.grid(row=9,column=0,sticky="we",pady=8)
+        ttk.Button(btns,text="Öneri Yap",command=self.suggest).pack(side="left")
+        ttk.Button(btns,text="Temizle",command=self.clear_form).pack(side="left",padx=6)
+
+        # Öneriler metin alanı (aynı sekmede)
+        res_frame = ttk.Frame(f); res_frame.grid(row=10, column=0, sticky="nsew", pady=(10,0))
+        f.rowconfigure(10, weight=1)   # büyüyebilmesi için
+        ttk.Label(res_frame, text="Öneriler / Teklif", font=("Arial",13,"bold")).pack(anchor="w")
+        self.txt = tk.Text(res_frame, wrap="word", height=20)
+        self.txt.pack(fill="both", expand=True, pady=6)
+        self.txt.config(state="disabled")
+        self.linker = HyperlinkManager(self.txt)
+
+        tools = ttk.Frame(res_frame); tools.pack(fill="x", pady=(4,0))
+        ttk.Button(tools, text="Teklifi PDF’e Aktar", command=self.export_pdf).pack(side="left")
+        self.btn_more = ttk.Button(tools, text="Daha fazla alternatif (2)", command=self.show_more, state="disabled")
+        self.btn_more.pack(side="right")
+
+    def choose_logo(self):
+        path = filedialog.askopenfilename(
+            title="Logo seç",
+            filetypes=[("Resim Dosyaları", "*.png;*.gif;*.jpg;*.jpeg")]
+        )
+        if path:
+            self.logo_path.set(path)
+            # Yönetim panelini güncelle
+            for w in self.admin_logo_holder.winfo_children():
+                w.destroy()
+            self.refresh_logo(self.admin_logo_holder)
+            # Ön paneli güncelle
+            for w in self.front_logo_holder.winfo_children():
+                w.destroy()
+            self.refresh_logo(self.front_logo_holder)
+
+    def refresh_logo(self, parent):
+        place_image_panel(parent, self.logo_path.get(), width_cm=6, height_cm=3)
+
+    # ---------- Detaylı Tarama (omuz-bel-diz) ----------
+    def open_detail_scan(self, who):
+        top = tk.Toplevel(self.root)
+        top.title("Detaylı Tarama — Omuz / Bel / Diz")
+        top.geometry("400x200")
+        top.resizable(False, False)
+        frm = ttk.Frame(top, padding=12); frm.pack(fill="both", expand=True)
+
+        if who == 'u1':
+            sv_s, sv_w, sv_k = self.u1_shoulder, self.u1_waist, self.u1_knee
+        else:
+            sv_s, sv_w, sv_k = self.u2_shoulder, self.u2_waist, self.u2_knee
+
+        ttk.Label(frm, text="* Bu bölüm opsiyoneldir; ölçüleri cm cinsinden giriniz.", foreground="#444").grid(row=0,column=0,columnspan=2, sticky="w", pady=(0,8))
+        ttk.Label(frm, text="Omuz genişliği (cm):").grid(row=1,column=0, sticky="e", padx=6, pady=4)
+        e1 = ttk.Entry(frm, textvariable=sv_s, width=10); e1.grid(row=1,column=1, sticky="w")
+        ttk.Label(frm, text="Bel genişliği (cm):").grid(row=2,column=0, sticky="e", padx=6, pady=4)
+        e2 = tttk.Entry(frm, textvariable=sv_w, width=10); e2.grid(row=2,column=1, sticky="w")
+        ttk.Label(frm, text="Diz genişliği (cm):").grid(row=3,column=0, sticky="e", padx=6, pady=4)
+        e3 = ttk.Entry(frm, textvariable=sv_k, width=10); e3.grid(row=3,column=1, sticky="w")
+
+        def save():
+            code = classify_body(sv_s.get(), sv_w.get(), sv_k.get())
+            if code is None:
+                messagebox.showerror("Eksik/Geçersiz", "Lütfen tüm ölçüleri pozitif sayı olarak giriniz.")
+                return
+            if who == 'u1':
+                self.u1_body_code.set(code)
+                self.lbl_u1_code.config(text=f"Vücut Kodu: {code}")
+            else:
+                self.u2_body_code.set(code)
+                self.lbl_u2_code.config(text=f"Vücut Kodu: {code}")
+            messagebox.showinfo("Kaydedildi", f"Detaylı tarama kaydedildi. Vücut tipi kodu: {code}")
+            top.destroy()
+
+        btns = ttk.Frame(frm); btns.grid(row=4, column=0, columnspan=2, pady=(10,0))
+        ttk.Button(btns, text="Kaydet", command=save).pack(side="left")
+        ttk.Button(btns, text="İptal", command=top.destroy).pack(side="left", padx=6)
+        e1.focus_set()
+
+    # ---------- Yönetim Paneli ----------
+    def build_admin(self):
+        a=self.tab_admin
+        top=ttk.Frame(a); top.pack(fill="x")
+        ttk.Label(top,text="Yönetim Paneli",font=("Arial",13,"bold")).pack(side="left")
+
+        self.admin_logo_holder = tk.Frame(a)
+        self.admin_logo_holder.pack(anchor="w", padx=8, pady=(6,10))
+        self.refresh_logo(self.admin_logo_holder)
+
+        ttk.Button(a, text="Logo Seç", command=self.choose_logo).pack(anchor="w", padx=8, pady=(0,10))
+
+        ttk.Label(a,text="Sunumda kullanılacak ürünleri 'Mağazada var' olarak işaretleyin. Öneri yalnız işaretli YATAKLAR arasından yapılır.").pack(anchor="w",pady=(6,6))
+        self.admin_frame=ttk.Frame(a); self.admin_frame.pack(fill="both",expand=True)
+        self.fill_admin_list()
+
+    def fill_admin_list(self):
+        for w in self.admin_frame.winfo_children(): w.destroy()
+        # Yataklar
+        lf=ttk.LabelFrame(self.admin_frame,text="Yataklar (PDF Tam Liste)"); lf.pack(side="left",fill="both",expand=True,padx=(0,6))
+        self.stock_mattress_vars={}
+        for pr in self.mattresses:
+            v=tk.BooleanVar(value=True)
+            self.stock_mattress_vars[pr["name"]]=v
+            ttk.Checkbutton(lf,text=f"{pr['name']}",variable=v).pack(anchor="w",padx=6,pady=1)
+        # Bazalar
+        bf=ttk.LabelFrame(self.admin_frame,text="Bazalar (PDF)"); bf.pack(side="left",fill="both",expand=True,padx=(0,6))
+        self.stock_base_vars={}
+        for pr in self.bases:
+            v=tk.BooleanVar(value=True)
+            self.stock_base_vars[pr["name"]]=v
+            ttk.Checkbutton(bf,text=pr["name"],variable=v).pack(anchor="w",padx=6,pady=1)
+
+    # ---------- Öneri Motoru ----------
+    def suggest(self):
+        size=self.var_size.get().strip()
+        if not size:
+            messagebox.showerror("Eksik bilgi","Yatak ölçüsü seçilmelidir."); return
+        # 1. kişi zorunlu
+        try:
+            h=int(self.u1_height.get()); w=int(self.u1_weight.get()); a=int(self.u1_age.get())
+        except:
+            messagebox.showerror("Eksik bilgi","1. kişi için boy, kilo ve yaş sayısal girilmelidir."); return
+        pos1=self.u1_pos.get(); issues1=[]
+        if self.u1_bel.get(): issues1+=["bel","sirt"]
+        if self.u1_boyun.get(): issues1+=["boyun"]
+        if self.u1_ter.get(): issues1+=["ter"]
+        if self.u1_alerji.get(): issues1+=["alerji"]
+
+        # 2. kişi OPSİYONEL
+        issues2 = []
+        if self.p2_frame.winfo_ismapped():
+            u2_h = self.u2_height.get().strip()
+            u2_w = self.u2_weight.get().strip()
+            u2_a = self.u2_age.get().strip()
+            try:
+                if u2_h and u2_w and u2_a:
+                    _h2 = int(u2_h); _w2 = int(u2_w); _a2 = int(u2_a)
+            except Exception:
+                pass
+            if self.u2_bel.get(): issues2 += ["bel","sirt"]
+            if self.u2_boyun.get(): issues2 += ["boyun"]
+            if self.u2_ter.get(): issues2 += ["ter"]
+            if self.u2_alerji.get(): issues2 += ["alerji"]
+
+        bmi1=w/((h/100)**2) if h>0 else 0
+        firmness=rec_firmness(bmi1,pos1,issues1)
+
+        # Detaylı tarama kodları (opsiyonel girilmişse)
+        body1 = classify_body(self.u1_shoulder.get(), self.u1_waist.get(), self.u1_knee.get())
+        if body1:
+            self.u1_body_code.set(body1); self.lbl_u1_code.config(text=f"Vücut Kodu: {body1}")
+        body2 = None
+        if self.p2_frame.winfo_ismapped():
+            body2 = classify_body(self.u2_shoulder.get(), self.u2_waist.get(), self.u2_knee.get())
+            if body2:
+                self.u2_body_code.set(body2); self.lbl_u2_code.config(text=f"Vücut Kodu: {body2}")
+
+        allowed_mattress={name for name,v in self.stock_mattress_vars.items() if v.get()}
+        allowed_bases={name for name,v in self.stock_base_vars.items() if v.get()}
+
+        pool=[p for p in self.mattresses if p["name"] in allowed_mattress]
+        seg=self.var_segment.get()
+
+        # Segment filtreleme
+        if seg != "(Seçilmedi)":
+            filtered_pool = []
+            for p in pool:
+                price = get_price(p["name"], size)
+                if price is None:
+                    continue
+                seg_inf = infer_segment(price)
+                if seg_inf == seg:
+                    filtered_pool.append(p)
+            if filtered_pool:
+                pool = filtered_pool
+            else:
+                messagebox.showwarning("Uyarı", f"'{seg}' segmentinde ürün bulunamadı. Tüm segmentlerden öneriliyor.")
+
+        def score_product(p):
+            k=0; why=[]
+            f=p.get("firmness_1_5",3)
+            if abs(f-firmness)<=1: k+=2; why.append("Önerilen sertlik derecesine yakın yapı.")
+            if body1 in ("A","D") and f<=3:
+                k+=1; why.append("Tarama koduna uygun yüzeyde basınç azaltıcı konfor.")
+            if body1=="C" and f>=4:
+                k+=1; why.append("Merkez destek ihtiyacina uygun yapısal destek.")
+            if self.p2_frame.winfo_ismapped():
+                k+=1; why.append("Çift kullanımda hareket hislerini azaltan katman düzeni.")
+                if body2 in ("A","D") and f<=3: k+=1
+                if body2=="C" and f>=4: k+=1
+            if any(x in issues1 for x in ["bel","sirt","boyun"]):
+                k+=2; why.append("Omurga hizalamasını destekleyen katman mimarisi.")
+            if "ter" in issues1 or "ter" in issues2:
+                why.append("Nefes alabilir yüzey yapısı dört mevsim ısı/ter dengesine yardımcı olur.")
+            price=get_price(p["name"], size)
+            seg_inf=infer_segment(price or 0)
+            if seg=="(Seçilmedi)":
+                if seg_inf in {"Başlangıç","Orta"}: k+=1
+            else:
+                if seg_inf==seg:
+                    k += 3
+                else:
+                    k -= 2
+            return k,why,price
+
+        annot=[]
+        for p in pool:
+            sc,why,price=score_product(p)
+            if price is None: continue
+            annot.append((p,sc,why,price))
+
+        annot.sort(key=lambda x:(x[3],-x[1]))  # fiyata göre artan
+
+        # ~%20–35 artış bandında 4 öneri
+        suggestions=[]; step_low,step_high=1.20,1.35
+        for p,sc,why,price in annot:
+            if not suggestions: suggestions.append((p,sc,why,price))
+            else:
+                prev=suggestions[-1][3]
+                if prev*step_low <= price <= prev*step_high:
+                    suggestions.append((p,sc,why,price))
+                elif price>prev*step_high and len(suggestions)<4:
+                    suggestions.append((p,sc,why,price))
+            if len(suggestions)>=4: break
+        if len(suggestions)<4:
+            for row in annot:
+                if all(row[0]["name"]!=s[0]["name"] for s in suggestions):
+                    suggestions.append(row)
+                if len(suggestions)>=4: break
+
+        # +2 alternatif (segment uyumluysa)
+        self.extra_alternatives=[]
+        for row in annot:
+            if all(row[0]["name"]!=s[0]["name"] for s in suggestions):
+                self.extra_alternatives.append(row)
+            if len(self.extra_alternatives)>=2: break
+        if seg != "(Seçilmedi)":
+            filtered_extra = []
+            for row in self.extra_alternatives:
+                seg_inf = infer_segment(row[3])
+                if seg_inf == seg:
+                    filtered_extra.append(row)
+            self.extra_alternatives = filtered_extra
+
+        self.last_suggestions=suggestions
+
+        # Çıktı
+        self.txt.config(state="normal"); self.txt.delete("1.0","end")
+        name=self.var_name.get().strip() or "müşteri"
+        sn=f"Sn. {name.capitalize()}" if self.var_name.get().strip() else "Sn. Müşteri"
+        self.txt.tag_config("bold", font=("Arial",10,"bold"))
+        self.txt.tag_config("h1", font=("Arial",11,"bold"))
+
+        size_lbl = self.var_size.get()
+        self.txt.insert("end", f"{sn}, seçtiğiniz parametrelere uygun ilk dört yatak önerimiz (ölçü: {size_lbl}) aşağıdadır.\n\n")
+        self.txt.insert("end", f"Önerilen sertlik derecesi: {firmness}/5\n", ("bold",))
+        if self.u1_body_code.get() and self.u1_body_code.get() != "-":
+            self.txt.insert("end", f"Vücut Tipi Kodu (1. kişi): {self.u1_body_code.get()}\n")
+        if self.p2_frame.winfo_ismapped() and self.u2_body_code.get() and self.u2_body_code.get() != "-":
+            self.txt.insert("end", f"Vücut Tipi Kodu (2. kişi): {self.u2_body_code.get()}\n")
+
+        base_pick = self.pick_base(size_lbl, allowed_bases)
+
+        for i,(p,sc,why,price) in enumerate(suggestions, start=1):
+            self.render_product_card(i,p,price,size_lbl,why,firmness,base_pick)
+
+        self.txt.insert("end","\n‘Daha fazla alternatif (2)’ butonu ile iki seçenek daha görebilirsiniz.\n")
+        disclaimer=("\n— YASAL VE ETİK BİLGİLENDİRME —\n"
+                    "Bu çalışma, mağaza deneyimimiz ve İdaş ürün teknolojileri ışığında kişiselleştirilmiş öneriler sunar; "
+                    "tıbbi tavsiye değildir. Kronik ağrı/rahatsızlıklar için hekiminize danışınız.")
+        self.txt.insert("end","\n"+disclaimer+"\n")
+        self.txt.config(state="disabled")
+        self.btn_more.config(state="normal" if self.extra_alternatives else "disabled")
+
+    def pick_base(self, size, allowed_bases):
+        candidates=[]
+        for bname, size_map in BAZA_DB.items():
+            if bname in allowed_bases and size in size_map:
+                candidates.append((bname, size_map[size]))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda x: x[1])
+        return {"name": candidates[0][0], "price": candidates[0][1], "url": self._resolve_url(candidates[0][0])}
+
+    def render_product_card(self, idx, p, price, size, why, firmness, base_pick):
+        self.txt.insert("end", f"\n{idx}. {p['name']}\n", ("h1",))
+        self.txt.insert("end", f"   Fiyat ({size}): {price:.2f} TL\n")
+        self.txt.insert("end", f"   Garanti: {p.get('warranty_years','-')} yıl   |   Yükseklik: {p.get('height_cm','-')} cm   |   Sertlik: {p.get('firmness_1_5',3)}/5\n")
+        tech=p.get("tech",[])
+        if tech:
+            self.txt.insert("end","   Öne çıkan teknolojiler/özellikler: "+", ".join(tech)+"\n")
+
+        bullets=list(dict.fromkeys(why+[
+            "Vücut hatlarınıza dengeli uyum sağlar; omuz and kalça hattında baskıyı azaltır.",
+            "Omurga hizalamasını destekleyen katman yapısı ile sabah daha dinç uyanmanıza yardımcı olur.",
+            "Partner hareketlerini minimize eden katman düzeni ile çift kullanımda konfor sağlar.",
+            "Nefes alabilir yüzey; ısı-nem dengesini dört mevsim optimize eder.",
+            "Kumaş and dolgu kalitesi ile uzun ömürlü form dayanımı."
+        ]))
+        self.txt.insert("end","   Neden Öneriyoruz:\n")
+        for b in bullets[:15]:
+            self.txt.insert("end", f"     • {b}\n")
+
+        # Ürün linki
+        self.txt.insert("end","   Ürün linki: ")
+        self.insert_link(p["url"])
+        self.txt.insert("end","\n")
+
+        # Baza önerisi
+        if base_pick:
+            self.txt.insert("end", f"   Uygun Baza Önerisi: {base_pick['name']} — {base_pick['price']:.2f} TL — ")
+            self.insert_link(base_pick["url"])
+            self.txt.insert("end","\n")
+        # --- Teklife Ekle butonu (öneri metni içine gömülü)
+        def _add_current():
+            self.add_to_cart(p, price, size)
+        btn = ttk.Button(self.txt, text="Teklife Ekle", command=_add_current)
+        self.txt.window_create("end", window=btn)
+        self.txt.insert("end", "\n")
+
+    def add_to_cart(self, p, price, size):
+        item = {
+            "name": p["name"],
+            "price": float(price),
+            "size": size,
+            "firmness": p.get("firmness_1_5", 3),
+            "height": p.get("height_cm", "-"),
+            "war": p.get("warranty_years", "-"),
+            "url": p.get("url", "")
+        }
+        # Aynı ürün + ölçü bir kez yer alsın
+        key = (item["name"], item["size"])
+        if not any((x["name"], x["size"]) == key for x in self.cart):
+            self.cart.append(item)
+            messagebox.showinfo("Eklendi", f"“{item['name']} ({item['size']})” teklife eklendi.")
+        else:
+            messagebox.showwarning("Zaten Ekli", f"“{item['name']} ({item['size']})” zaten teklifte var.")
+
+    def export_pdf(self):
+        if not self.cart:
+            messagebox.showerror("Boş Teklif", "PDF’e aktarılacak ürün yok. Önce önerilerden 'Teklife Ekle' yapın.")
+            return
+
+        # Önce basit bir HTML şablonu hazırla (ReportLab yoksa buna düşer)
+        today = datetime.date.today().strftime("%d.%m.%Y")
+        müşteri = (self.var_name.get().strip() or "Müşteri")
+        html_lines = [
+            "<html><meta charset='utf-8'><style>",
+            "body{font-family:Arial,Helvetica,sans-serif;margin:24px}",
+            "h1{font-size:20px;margin:0 0 10px} h2{font-size:16px;margin:18px 0 6px}",
+            "table{border-collapse:collapse;width:100%}",
+            "th,td{border:1px solid #ddd;padding:8px;text-align:left}",
+            ".muted{color:#666;font-size:12px}",
+            "</style><body>",
+            f"<h1>İdaş Yatak Teklif Formu – {müşteri}</h1>",
+            f"<div class='muted'>Tarih: {today} • Ölçü(ler): {', '.join(sorted({x['size'] for x in self.cart}))}</div>",
+            "<table><tr><th>Ürün</th><th>Ölçü</th><th>Sertlik</th><th>Yükseklik</th><th>Garanti</th><th>Fiyat (TL)</th></tr>"
+        ]
+        toplam = 0.0
+        for it in self.cart:
+            toplam += it["price"]
+            html_lines.append(
+                f"<tr><td>{it['name']}</td><td>{it['size']}</td><td>{it['firmness']}/5</td>"
+                f"<td>{it['height']}</td><td>{it['war']}</td><td>{it['price']:.2f}</td></tr>"
+            )
+        html_lines += [
+            f"<tr><td colspan='5' style='text-align:right'><b>TOPLAM</b></td><td><b>{toplam:.2f}</b></td></tr>",
+            "</table>",
+            "<p class='muted'>Bu teklif kişiselleştirilmiş öneriler içerir; tıbbi tavsiye değildir.</p>",
+            "</body></html>"
+        ]
+        html_path = tempfile.NamedTemporaryFile(prefix="idas_tekli̇f_", suffix=".html", delete=False)
+        html_path.write("\n".join(html_lines).encode("utf-8")); html_path.close()
+
+        # ReportLab varsa gerçek PDF üret
+        try:
+            from reportlab.lib.pagesizes import A4
+            from reportlab.pdfgen import canvas
+            from reportlab.lib.units import mm
+            from reportlab.lib import fonts
+
+            pdf_file = tempfile.NamedTemporaryFile(prefix="idas_tekli̇f_", suffix=".pdf", delete=False).name
+            c = canvas.Canvas(pdf_file, pagesize=A4)
+            W, H = A4
+            y = H - 20*mm
+
+            c.setFont("Helvetica-Bold", 14)
+            c.drawString(20*mm, y, f"İdaş Yatak Teklif Formu – {müşteri}")
+            y -= 8*mm
+            c.setFont("Helvetica", 10)
+            c.drawString(20*mm, y, f"Tarih: {today}")
+            y -= 6*mm
+
+            # Tablo başlığı
+            c.setFont("Helvetica-Bold", 9)
+            headers = ["Ürün", "Ölçü", "Sertlik", "Yükseklik", "Garanti", "Fiyat (TL)"]
+            widths = [70, 25, 20, 25, 25, 25]  # mm
+            x = 20*mm
+            for htxt, wmm in zip(headers, widths):
+                c.drawString(x, y, htxt)
+                x += wmm*mm
+            y -= 5*mm
+            c.line(20*mm, y, (20+sum(widths))*mm, y); y -= 4*mm
+
+            c.setFont("Helvetica", 9)
+            toplam = 0.0
+            for it in self.cart:
+                if y < 20*mm:  # yeni sayfa
+                    c.showPage(); y = H - 20*mm
+                    c.setFont("Helvetica-Bold", 9)
+                    x = 20*mm
+                    for htxt, wmm in zip(headers, widths):
+                        c.drawString(x, y, htxt)
+                        x += wmm*mm
+                    y -= 5*mm
+                    c.line(20*mm, y, (20+sum(widths))*mm, y); y -= 4*mm
+                    c.setFont("Helvetica", 9)
+                x = 20*mm
+                row = [it["name"], it["size"], f"{it['firmness']}/5", str(it["height"]), str(it["war"]), f"{it['price']:.2f}"]
+                for cell, wmm in zip(row, widths):
+                    c.drawString(x, y, str(cell))
+                    x += wmm*mm
+                toplam += it["price"]
+                y -= 6*mm
+
+            # Toplam
+            y -= 4*mm
+            c.setFont("Helvetica-Bold", 10)
+            c.drawRightString((20+sum(widths))*mm, y, f"TOPLAM: {toplam:.2f} TL")
+
+            c.showPage(); c.save()
+
+            webbrowser.open("file://" + pdf_file)
+        except Exception:
+            # ReportLab yoksa HTML’i aç; tarayıcıdan "PDF olarak yazdır" kullanılabilir.
+            webbrowser.open("file://" + html_path.name)
+            messagebox.showinfo(
+                "HTML açıldı",
+                "Bilgisayarınızda PDF kütüphanesi bulunamadı. Açılan sayfayı tarayıcıdan 'PDF olarak yazdır' ile kaydedebilirsiniz."
+            )
+
+    # ---------- Alternatifler ----------
+    def show_more(self):
+        if not self.extra_alternatives: return
+        self.txt.config(state="normal")
+        self.txt.insert("end","\n— Ek Alternatifler —\n",("bold",))
+        size=self.var_size.get()
+        for idx,(p,sc,why,price) in enumerate(self.extra_alternatives,start=1):
+            self.txt.insert("end", f"\n{idx}. {p['name']}\n", ("h1",))
+            self.txt.insert("end", f"   Fiyat ({size}): {price:.2f} TL\n")
+            self.txt.insert("end", f"   Garanti: {p.get('warranty_years','-')} yıl   |   Yükseklik: {p.get('height_cm','-')} cm   |   Sertlik: {p.get('firmness_1_5',3)}/5\n")
+            if p.get("tech"):
+                self.txt.insert("end","   Öne çıkan teknolojiler/özellikler: "+", ".join(p["tech"])+"\n")
+            self.txt.insert("end","   Ürün linki: ")
+            self.insert_link(p["url"])
+            self.txt.insert("end","\n")
+        self.txt.config(state="disabled")
+        self.btn_more.config(state="disabled")
+
+    def insert_link(self, url):
+        self.txt.insert("end", url, self.linker.add(lambda u=url: webbrowser.open(u)))
+
+    def clear_form(self):
+        for v in [self.u1_height,self.u1_weight,self.u1_age,self.u2_height,self.u2_weight,self.u2_age]:
+            v.set("")
+        for v in [self.u1_bel,self.u1_boyun,self.u1_ter,self.u1_alerji,self.u2_bel,self.u2_boyun,self.u2_ter,self.u2_alerji]:
+            v.set(False)
+        for v in [self.u1_shoulder,self.u1_waist,self.u1_knee,self.u2_shoulder,self.u2_waist,self.u2_knee]:
+            v.set("")
+        self.u1_body_code.set("-"); self.lbl_u1_code.config(text="Vücut Kodu: -")
+        self.u2_body_code.set("-"); self.lbl_u2_code.config(text="Vücut Kodu: -")
+        self.var_people.set("1"); self.var_segment.set("(Seçilmedi)")
+        self.txt.config(state="normal"); self.txt.delete("1.0","end"); self.txt.config(state="disabled")
+
+# --- Çalıştır ---
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = App(root)
+    root.mainloop()
